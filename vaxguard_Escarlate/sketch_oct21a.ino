@@ -6,6 +6,7 @@
 #include <Arduino_LED_Matrix.h>
 #include <Servo.h>
 #include "secrets.h"
+#include "pagina.h"
 
 // ================== Pinos ==================
 #define PIN_DHT      3
@@ -29,16 +30,12 @@ DHT dht(PIN_DHT, DHTTYPE);
 #define SERVO_FECHADO_DEG   0
 #define SERVO_ABERTO_DEG    90
 
-// ================== Sensor de luz (LDR) ==================
-// O limiar NÃO é fixo: é calibrado automaticamente no boot
-// (assume que a placa liga com a porta FECHADA).
-// Se a porta estiver aberta no boot, a calibração falha — abra e feche
-// a porta uma vez para recalibrar em runtime via botão (opcional, ver abaixo).
-#define MARGEM_LUZ           120   // quanto acima do "fechado" indica abertura
-#define HISTERESE_LUZ         60   // zona morta para evitar oscilação
-#define AMOSTRAS_MEDIA         8   // média móvel do LDR
-#define AMOSTRAS_CALIBRACAO   20   // amostras na calibração do boot
-#define LDR_INVERTIDO      false   // true se o LDR lê alto no escuro
+// ================== LDR ==================
+#define MARGEM_LUZ           40
+#define HISTERESE_LUZ        40
+#define AMOSTRAS_MEDIA         8
+#define AMOSTRAS_CALIBRACAO   20
+#define LDR_INVERTIDO      false
 
 // ================== Constantes ==================
 #define INTERVALO_LEITURA_PADRAO 5000UL
@@ -78,6 +75,7 @@ uint32_t seqGlobal = 0;
 ArduinoLEDMatrix matrix;
 WiFiClient wifiClient;
 Servo servoVentilacao;
+WiFiServer servidorWeb(80);
 
 Estado estadoAtual = NORMAL;
 Estado estadoAnterior = NORMAL;
@@ -94,10 +92,16 @@ float limiteTemp = LIMITE_TEMP_PADRAO;
 unsigned long intervaloLeitura = INTERVALO_LEITURA_PADRAO;
 int falhasDHT = 0;
 
-// LDR: calibração automática + histerese + média móvel
-uint16_t luzFechada = 0;          // referência "porta fechada"
-uint16_t limiarLuz = 0;           // calculado no boot
-bool estadoLuzAberta = false;     // com histerese
+// Últimos valores lidos (usados pelo servidor web)
+float ultimaTemp = 0;
+float ultimaUmid = 0;
+bool ultimaPorta = false;
+uint16_t ultimaLuz = 0;
+
+// LDR
+uint16_t luzFechada = 0;
+uint16_t limiarLuz = 0;
+bool estadoLuzAberta = false;
 uint16_t amostrasLuz[AMOSTRAS_MEDIA];
 int idxAmostraLuz = 0;
 bool amostrasLuzCheias = false;
@@ -167,6 +171,7 @@ void atualizarBuzzer(unsigned long agora);
 void ligarBuzzerContinuo();
 void desligarBuzzer();
 void dispararBipeCurto();
+void atenderNavegador();
 
 // ================== Setup ==================
 void setup() {
@@ -191,30 +196,62 @@ void setup() {
   matrix.begin();
 
   carregarConfig();
-
-  // Calibra o LDR assumindo que a porta está FECHADA
   calibrarLdr();
+  
+  // ===== CONEXÃO WI-FI (revisada) =====
+  Serial.println("Limpando estado anterior do Wi-Fi...");
+  WiFi.disconnect();
+  WiFi.end();
+  delay(1000);
 
   conectarWiFi(millis());
+
+  Serial.print("Aguardando conexao Wi-Fi");
+  unsigned long inicioWiFi = millis();
+  
+  // Aguarda até 20s por um IP VÁLIDO (não só WL_CONNECTED)
+  while (millis() - inicioWiFi < 20000) {
+    if (WiFi.status() == WL_CONNECTED && WiFi.localIP() != IPAddress(0,0,0,0)) {
+      break;
+    }
+    Serial.print(".");
+    delay(500);
+  }
+  Serial.println();
+
+  // Dá mais 1.5s para o DHCP estabilizar (problema conhecido do R4 WiFi)
+  delay(1500);
+
+  servidorWeb.begin();
 
   Serial.println("=================================");
   Serial.println("VaxGuard Connect iniciado");
   Serial.print("Limite temp: "); Serial.println(limiteTemp);
   Serial.print("Intervalo leitura: "); Serial.println(intervaloLeitura);
-  Serial.print("Nivel porta aberta (tilt): ");
-  Serial.println(PORTA_ABERTA_NIVEL == HIGH ? "HIGH" : "LOW");
   Serial.print("Luz fechada (calibrado): "); Serial.println(luzFechada);
   Serial.print("Limiar de luz: "); Serial.println(limiarLuz);
-  Serial.print("Margem: "); Serial.print(MARGEM_LUZ);
-  Serial.print("  Histerese: "); Serial.println(HISTERESE_LUZ);
-  Serial.println("Atuador: MICRO SERVO");
-  Serial.println("Sensores: DHT11 + Tilt + LDR");
+  Serial.print("Servidor Python: http://");
+  Serial.print(SERVER_IP); Serial.print(":"); Serial.print(SERVER_PORT);
+  Serial.println(SERVER_PATH);
+  Serial.println("=================================");
+
+  // Diagnóstico de Wi-Fi
+  if (WiFi.status() == WL_CONNECTED && WiFi.localIP() != IPAddress(0,0,0,0)) {
+    Serial.print("Wi-Fi OK. Acesse no navegador: http://");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("!! FALHA Wi-Fi: sem IP valido.");
+    Serial.print("   Status: "); Serial.println(WiFi.status());
+    Serial.println("   Verifique SSID/senha no secrets.h ou use hotspot.");
+  }
   Serial.println("=================================");
 }
 
 // ================== Loop principal ==================
 void loop() {
   unsigned long agora = millis();
+
+  atenderNavegador();
 
   if (WiFi.status() != WL_CONNECTED) {
     wifiConectado = false;
@@ -268,8 +305,48 @@ void loop() {
   if (agora - ultimoRefreshWDT > 300000UL) {
     NVIC_SystemReset();
   }
-
   resetarWatchdog();
+}
+
+// ================== Servidor web ==================
+void atenderNavegador() {
+  WiFiClient cliente = servidorWeb.available();
+  if (!cliente) return;
+
+  String requisicao = "";
+  unsigned long inicio = millis();
+  while (cliente.connected() && (millis() - inicio < 500)) {
+    if (cliente.available()) {
+      char c = cliente.read();
+      requisicao += c;
+      if (requisicao.endsWith("\r\n\r\n")) break;
+    }
+  }
+
+  if (requisicao.indexOf("GET /dados") >= 0) {
+    String json = "{";
+    json += "\"temp\":" + String(ultimaTemp, 1) + ",";
+    json += "\"umid\":" + String(ultimaUmid, 0) + ",";
+    json += "\"porta\":" + String(ultimaPorta ? "true" : "false") + ",";
+    json += "\"luz\":" + String(ultimaLuz) + ",";
+    json += "\"estado\":" + String((int)estadoAtual);
+    json += "}";
+
+    cliente.println("HTTP/1.1 200 OK");
+    cliente.println("Content-Type: application/json");
+    cliente.println("Access-Control-Allow-Origin: *");
+    cliente.println("Connection: close");
+    cliente.println();
+    cliente.println(json);
+  } else {
+    cliente.println("HTTP/1.1 200 OK");
+    cliente.println("Content-Type: text/html; charset=UTF-8");
+    cliente.println("Connection: close");
+    cliente.println();
+    cliente.println(PAGINA_HTML);
+  }
+  delay(1);
+  cliente.stop();
 }
 
 // ================== Buzzer ==================
@@ -297,9 +374,7 @@ void atualizarBuzzer(unsigned long agora) {
   }
 }
 
-// ================== LDR: calibração + média + histerese ==================
-
-// Lê o LDR 8 vezes seguidas e retorna a média
+// ================== LDR ==================
 uint16_t lerLdrMedia() {
   uint32_t soma = 0;
   for (int i = 0; i < AMOSTRAS_MEDIA; i++) {
@@ -309,7 +384,6 @@ uint16_t lerLdrMedia() {
   return (uint16_t)(soma / AMOSTRAS_MEDIA);
 }
 
-// Lê o LDR várias vezes no boot e calcula o limiar
 void calibrarLdr() {
   uint32_t soma = 0;
   for (int i = 0; i < AMOSTRAS_CALIBRACAO; i++) {
@@ -318,21 +392,15 @@ void calibrarLdr() {
   }
   luzFechada = (uint16_t)(soma / AMOSTRAS_CALIBRACAO);
   limiarLuz = luzFechada + MARGEM_LUZ;
+  if (limiarLuz > 1023) limiarLuz = 1023;
   estadoLuzAberta = false;
-
-  // Zera a média móvel
   for (int i = 0; i < AMOSTRAS_MEDIA; i++) amostrasLuz[i] = luzFechada;
   idxAmostraLuz = 0;
   amostrasLuzCheias = false;
 }
 
-// Aplica histerese sobre a luz: só muda de estado se o valor
-// ultrapassar o limiar + histerese (para abrir) ou cair abaixo
-// do limiar - histerese (para fechar).
 bool luzIndicaPortaAberta(uint16_t luzMedia) {
-  bool acima;
-  bool abaixo;
-
+  bool acima, abaixo;
   if (LDR_INVERTIDO) {
     acima  = (luzMedia < (limiarLuz - HISTERESE_LUZ));
     abaixo = (luzMedia > (limiarLuz + HISTERESE_LUZ));
@@ -340,7 +408,6 @@ bool luzIndicaPortaAberta(uint16_t luzMedia) {
     acima  = (luzMedia > (limiarLuz + HISTERESE_LUZ));
     abaixo = (luzMedia < (limiarLuz - HISTERESE_LUZ));
   }
-
   if (estadoLuzAberta) {
     if (abaixo) estadoLuzAberta = false;
   } else {
@@ -350,7 +417,6 @@ bool luzIndicaPortaAberta(uint16_t luzMedia) {
 }
 
 // ================== Auxiliares ==================
-
 bool tiltIndicaPortaAberta() {
   return digitalRead(PIN_PORTA) == PORTA_ABERTA_NIVEL;
 }
@@ -370,26 +436,18 @@ void moverServo(int angulo) {
 void resetarWatchdog() {}
 
 // ================== Leitura e estados ==================
-
 void lerSensores(unsigned long agora) {
   bool wifiEstavaLigado = (WiFi.status() == WL_CONNECTED);
-  if (wifiEstavaLigado) {
-    WiFi.disconnect();
-    delay(10);
-  }
+  if (wifiEstavaLigado) { WiFi.disconnect(); delay(10); }
 
   float t = dht.readTemperature();
   float h = dht.readHumidity();
 
-  if (wifiEstavaLigado) {
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
-  }
+  if (wifiEstavaLigado) { WiFi.begin(WIFI_SSID, WIFI_PASS); }
 
   if (isnan(t) || isnan(h)) {
     falhasDHT++;
-    Serial.print("DHT falhou (");
-    Serial.print(falhasDHT);
-    Serial.println("/3)");
+    Serial.print("DHT falhou ("); Serial.print(falhasDHT); Serial.println("/3)");
     if (falhasDHT >= 3 && estadoAtual != FALHA_SENSOR) {
       Estado ant = estadoAtual;
       estadoAtual = FALHA_SENSOR;
@@ -403,6 +461,11 @@ void lerSensores(unsigned long agora) {
   bool tiltAberta = tiltIndicaPortaAberta();
   bool luzAberta = luzIndicaPortaAberta(luz);
   bool porta = tiltAberta || luzAberta;
+
+  ultimaTemp = t;
+  ultimaUmid = h;
+  ultimaPorta = porta;
+  ultimaLuz = luz;
 
   Leitura L;
   L.seq = ++seqGlobal;
@@ -423,7 +486,6 @@ void lerSensores(unsigned long agora) {
   Serial.print("Temp: "); Serial.print(t);
   Serial.print(" Umid: "); Serial.print(h);
   Serial.print(" Luz: "); Serial.print(luz);
-  Serial.print(" (limiar "); Serial.print(limiarLuz); Serial.print(")");
   Serial.print(" Tilt: "); Serial.print(tiltAberta ? "AB" : "FE");
   Serial.print(" LDR: "); Serial.print(luzAberta ? "AB" : "FE");
   Serial.print(" => "); Serial.println(porta ? "ABERTA" : "FECHADA");
@@ -449,10 +511,7 @@ void avaliarEstado(unsigned long agora) {
 
   if (porta && !portaEstavaAberta) {
     portaAbertaDesdeMs = agora;
-    Serial.print(">> Porta ABRIU (tilt=");
-    Serial.print(tiltIndicaPortaAberta() ? "1" : "0");
-    Serial.print(" ldr="); Serial.print(luz);
-    Serial.println(")");
+    Serial.println(">> Porta ABRIU");
   } else if (!porta && portaEstavaAberta) {
     portaAbertaDesdeMs = 0;
     Serial.println(">> Porta FECHOU");
@@ -512,29 +571,20 @@ void executarAtuacao(unsigned long agora) {
   switch (estadoAtual) {
     case NORMAL:
       digitalWrite(PIN_LED_R, LOW); digitalWrite(PIN_LED_G, HIGH); digitalWrite(PIN_LED_Y, LOW);
-      desligarBuzzer();
-      moverServo(SERVO_FECHADO_DEG);
-      break;
+      desligarBuzzer(); moverServo(SERVO_FECHADO_DEG); break;
     case ATENCAO:
       digitalWrite(PIN_LED_R, LOW); digitalWrite(PIN_LED_G, LOW); digitalWrite(PIN_LED_Y, HIGH);
-      moverServo(SERVO_FECHADO_DEG);
-      break;
+      moverServo(SERVO_FECHADO_DEG); break;
     case CRITICO:
       digitalWrite(PIN_LED_R, HIGH); digitalWrite(PIN_LED_G, LOW); digitalWrite(PIN_LED_Y, LOW);
-      ligarBuzzerContinuo();
-      moverServo(SERVO_ABERTO_DEG);
-      break;
+      ligarBuzzerContinuo(); moverServo(SERVO_ABERTO_DEG); break;
     case RECONHECIDO:
       digitalWrite(PIN_LED_R, (agora / 500) % 2); digitalWrite(PIN_LED_G, LOW); digitalWrite(PIN_LED_Y, LOW);
-      desligarBuzzer();
-      moverServo(SERVO_ABERTO_DEG);
-      break;
+      desligarBuzzer(); moverServo(SERVO_ABERTO_DEG); break;
     case FALHA_SENSOR:
       digitalWrite(PIN_LED_R, (agora / 500) % 2); digitalWrite(PIN_LED_G, LOW);
       digitalWrite(PIN_LED_Y, ((agora / 500) + 1) % 2);
-      desligarBuzzer();
-      moverServo(SERVO_FECHADO_DEG);
-      break;
+      desligarBuzzer(); moverServo(SERVO_FECHADO_DEG); break;
   }
 }
 
@@ -553,12 +603,11 @@ void adicionarEventoBuffer(Estado ant, Estado novo, const char* motivo) {
   Serial.print((int)novo); Serial.print(" ("); Serial.print(motivo); Serial.println(")");
 
   uint16_t luz = lerLdrMedia();
-
   Leitura ev;
   ev.seq = ++seqGlobal;
   ev.ts = millis() / 1000;
-  ev.temp = dht.readTemperature();
-  ev.umid = dht.readHumidity();
+  ev.temp = ultimaTemp;
+  ev.umid = ultimaUmid;
   ev.porta = portaEstaAberta(luz);
   ev.estado = (uint8_t)novo;
   ev.estadoAnterior = (uint8_t)ant;
@@ -573,7 +622,7 @@ void adicionarEventoBuffer(Estado ant, Estado novo, const char* motivo) {
 
 // ================== Wi-Fi ==================
 void conectarWiFi(unsigned long agora) {
-  Serial.print("WiFi backoff: "); Serial.println(backoffAtual);
+  Serial.print("WiFi begin (tentativa). Backoff: "); Serial.println(backoffAtual);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   tempoReconexaoMs = agora;
   backoffAtual = min(backoffAtual * 2, 30000UL);
@@ -601,24 +650,36 @@ void tentarEnviarBuffer() {
 
   if (enviarJSON(json)) {
     bufCount--;
+    Serial.print(">> Enviado ao Python (seq="); Serial.print(L.seq); Serial.println(")");
   }
 }
 
 bool enviarJSON(const String &json) {
-  if (wifiClient.connect("192.168.1.100", 5000)) {
-    wifiClient.println("POST /api/telemetry HTTP/1.1");
-    wifiClient.println("Host: 192.168.1.100:5000");
-    wifiClient.println("Content-Type: application/json");
-    wifiClient.print("Content-Length: ");
-    wifiClient.println(json.length());
-    wifiClient.println("Connection: close");
-    wifiClient.println();
-    wifiClient.println(json);
-    delay(20);
-    wifiClient.stop();
-    return true;
+  if (!wifiClient.connect(SERVER_IP, SERVER_PORT)) {
+    return false;
   }
-  return false;
+
+  wifiClient.print("POST ");
+  wifiClient.print(SERVER_PATH);
+  wifiClient.println(" HTTP/1.1");
+
+  wifiClient.print("Host: ");
+  wifiClient.print(SERVER_IP);
+  wifiClient.print(":");
+  wifiClient.println(SERVER_PORT);
+
+  wifiClient.println("Content-Type: application/json");
+
+  wifiClient.print("Content-Length: ");
+  wifiClient.println(json.length());
+
+  wifiClient.println("Connection: close");
+  wifiClient.println();
+  wifiClient.println(json);
+
+  delay(50);
+  wifiClient.stop();
+  return true;
 }
 
 // ================== EEPROM ==================
